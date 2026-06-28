@@ -38,10 +38,10 @@ class UrlShortenerTests(unittest.TestCase):
             headers={"Idempotency-Key": "id-1"},
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertEqual(body["long_url"], "https://example.com")
-        self.assertTrue(body["short_url"].startswith("http://localhost:8000/"))
+        self.assertTrue(body["short_url"].startswith("http://testserver/"))
         self.assertTrue(body["alias"])
 
         with self.TestingSessionLocal() as db:
@@ -53,10 +53,10 @@ class UrlShortenerTests(unittest.TestCase):
             db.add(main_module.URL(alias="abc123", long_url="https://example.com"))
             db.commit()
 
-        response = self.client.get("/abc123")
+        response = self.client.get("/abc123", follow_redirects=False)
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"redirect_to": "https://example.com"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["location"], "https://example.com")
 
         with self.TestingSessionLocal() as db:
             updated = db.query(main_module.URL).filter(main_module.URL.alias == "abc123").one()

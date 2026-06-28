@@ -1,14 +1,20 @@
 # main.py
-from fastapi import FastAPI, Request, HTTPException, Depends
+from typing import Optional
+import hashlib
+import re
+import uuid
+from urllib.parse import urlparse
+
+import redis
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
+from redis.exceptions import ConnectionError
 from sqlalchemy.orm import Session
 
 try:
-    from .db import SessionLocal, URL, IdempotencyKey, Base
+    from .db import IdempotencyKey, SessionLocal, URL
 except ImportError:
-    from db import SessionLocal, URL, IdempotencyKey, Base
-
-import hashlib, uuid, redis, datetime
-from redis.exceptions import ConnectionError
+    from db import IdempotencyKey, SessionLocal, URL
 
 app = FastAPI()
 
@@ -27,7 +33,27 @@ def get_db():
     finally:
         db.close()
 
-# Rate limiting middleware
+
+def get_client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def is_valid_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def is_valid_alias(alias: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,32}", alias))
+
+
+def generate_alias(db: Session, length: int = 6) -> str:
+    while True:
+        alias = uuid.uuid4().hex[:length]
+        if not db.query(URL).filter(URL.alias == alias).first():
+            return alias
+
+
 def rate_limit(ip: str, limit: int, window: int = 60):
     if r is None:
         return
@@ -37,80 +63,105 @@ def rate_limit(ip: str, limit: int, window: int = 60):
         current = r.get(key)
         if current and int(current) >= limit:
             raise HTTPException(status_code=429, detail="Too Many Requests")
-        else:
-            pipe = r.pipeline()
-            pipe.incr(key, 1)
-            pipe.expire(key, window)
-            pipe.execute()
+
+        pipe = r.pipeline()
+        pipe.incr(key, 1)
+        pipe.expire(key, window)
+        pipe.execute()
     except ConnectionError:
         return
 
-@app.post("/shorten")
-def shorten_url(request: Request, long_url: str, custom_alias: str = None, db: Session = Depends(get_db)):
-    ip = request.client.host
-    rate_limit(ip, limit=10)  # 10 requests/minute
 
-    # Idempotency key
+@app.post("/shorten", status_code=status.HTTP_201_CREATED)
+def shorten_url(
+    request: Request,
+    long_url: str,
+    custom_alias: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    rate_limit(ip, limit=10)
+
+    if not long_url or not long_url.strip():
+        raise HTTPException(status_code=400, detail="long_url is required")
+
+    if not is_valid_url(long_url):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    if custom_alias is not None and not is_valid_alias(custom_alias):
+        raise HTTPException(status_code=400, detail="Invalid custom alias")
+
     idempotency_key = request.headers.get("Idempotency-Key")
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header required")
 
-    existing = db.query(IdempotencyKey).filter(IdempotencyKey.key == idempotency_key).first()
-    if existing:
-        return {"short_url": existing.response}
+    existing_request = (
+        db.query(IdempotencyKey)
+        .filter(IdempotencyKey.key == idempotency_key)
+        .first()
+    )
+    if existing_request:
+        return {"short_url": existing_request.response}
 
-    alias = custom_alias or str(uuid.uuid4())[:6]
+    alias = custom_alias or generate_alias(db)
+    existing_alias = db.query(URL).filter(URL.alias == alias).first()
+    if existing_alias and custom_alias:
+        raise HTTPException(status_code=409, detail="Alias already exists")
+
     new_url = URL(alias=alias, long_url=long_url)
     db.add(new_url)
-    db.commit()
+    db.flush()
 
-    short_url = f"http://localhost:8000/{alias}"
+    short_url = f"{request.base_url}{alias}"
 
-    # Save idempotency record
     record = IdempotencyKey(
         key=idempotency_key,
-        request_hash=hashlib.sha256(long_url.encode()).hexdigest(),
-        response=short_url
+        request_hash=hashlib.sha256(long_url.encode("utf-8")).hexdigest(),
+        response=short_url,
     )
     db.add(record)
     db.commit()
 
     return {"short_url": short_url, "alias": alias, "long_url": long_url}
 
-@app.get("/{alias}")
-def redirect(alias: str, request: Request, db: Session = Depends(get_db)):
-    ip = request.client.host
-    rate_limit(ip, limit=100)  # 100 requests/minute
 
-    url = db.query(URL).filter(URL.alias == alias).first()
-    if not url:
+@app.get("/{alias}", include_in_schema=False)
+def redirect(alias: str, request: Request, db: Session = Depends(get_db)):
+    ip = get_client_ip(request)
+    rate_limit(ip, limit=100)
+
+    url_record = db.query(URL).filter(URL.alias == alias).first()
+    if not url_record:
         raise HTTPException(status_code=404, detail="Alias not found")
 
-    url.clicks += 1
+    url_record.clicks += 1
     db.commit()
-    return {"redirect_to": url.long_url}
+    return RedirectResponse(url=url_record.long_url, status_code=status.HTTP_302_FOUND)
+
 
 @app.get("/info/{alias}")
 def info(alias: str, request: Request, db: Session = Depends(get_db)):
-    ip = request.client.host
-    rate_limit(ip, limit=50)  # 50 requests/minute
+    ip = get_client_ip(request)
+    rate_limit(ip, limit=50)
 
-    url = db.query(URL).filter(URL.alias == alias).first()
-    if not url:
+    url_record = db.query(URL).filter(URL.alias == alias).first()
+    if not url_record:
         raise HTTPException(status_code=404, detail="Alias not found")
 
     return {
-        "alias": url.alias,
-        "long_url": url.long_url,
-        "created_at": url.created_at,
-        "clicks": url.clicks
+        "alias": url_record.alias,
+        "long_url": url_record.long_url,
+        "created_at": url_record.created_at,
+        "clicks": url_record.clicks,
     }
+
 
 @app.delete("/delete/{alias}")
 def delete(alias: str, db: Session = Depends(get_db)):
-    url = db.query(URL).filter(URL.alias == alias).first()
-    if not url:
+    url_record = db.query(URL).filter(URL.alias == alias).first()
+    if not url_record:
         return {"message": "Already deleted or not found"}
-    db.delete(url)
+
+    db.delete(url_record)
     db.commit()
     return {"message": "Short URL deleted successfully", "alias": alias}
